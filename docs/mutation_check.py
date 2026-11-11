@@ -80,8 +80,9 @@ STORE = [
     ("reader: switched-off theme worn", "reader.rs", "if installed.kind != Kind::Theme || !state.is_enabled(app, id) {", "if installed.kind != Kind::Theme {"),
     ("location: override unchecked", "location.rs", "return if looks_absolute(os, &custom) {", "return if true {"),
     ("location: relative folders accepted", "location.rs", "env(name).filter(|v| looks_absolute(os, v))", "env(name)"),
-    ("state: newer schema accepted", "state.rs", "if head.schema > SCHEMA {", "if false {"),
+    ("state: newer read version accepted", "state.rs", "if read_version > KNOWN_READ_VERSION {", "if false {"),
     ("state: size cap off", "state.rs", "if bytes.len() as u64 > MAX_STATE_BYTES {", "if false {"),
+    ("state: newer write version accepted", "store.rs", "if state.write_version > KNOWN_WRITE_VERSION {", "if false {"),
 ]
 
 # Survivors that cannot be killed, with the reason. Anything else that survives fails the run.

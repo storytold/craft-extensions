@@ -32,7 +32,7 @@ whose maintainer answers the direction below and [`docs/THREAT-MODEL.md`](docs/T
 | Crate | What it is | Builds for wasm |
 |---|---|---|
 | `craft-ext-core` | Package manifest, ids, paths, trust tiers, the theme palette and contrast check, the catalogue index schema. Pure data and validation. 63 tests; 27 deliberate breakages each caught (`docs/mutation_check.py core`). | yes |
-| `craft-ext-store` | The shared store on disk: bounded unpacking, atomic installs, enable per app, the read side apps use. Never touches the network. 48 tests; 34 deliberate breakages, 31 caught and 3 equivalent with stated reasons (`docs/mutation_check.py store`). | no |
+| `craft-ext-store` | The shared store on disk: bounded unpacking, atomic installs, enable per app, the read side apps use. Never touches the network. 50 tests; 35 deliberate breakages, 32 caught and 3 equivalent with stated reasons (`docs/mutation_check.py store`). | no |
 
 ## Rules this code follows
 

@@ -11,7 +11,7 @@
 //! a bumped generation, and a failure leaves the previous state and no stray package folder. A file
 //! can never replace a first-party extension, and a downgrade is refused.
 
-use crate::state::{Installed, STATE_FILE, State, StateError};
+use crate::state::{Installed, KNOWN_WRITE_VERSION, STATE_FILE, State, StateError};
 use crate::unpack::{Caps, UnpackError, unpack_into};
 use craft_ext_core::id::{AppId, ExtensionId};
 use craft_ext_core::manifest::{Kind, THEME_FILE};
@@ -126,6 +126,9 @@ impl Store {
     fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T, StoreError>) -> Result<T, StoreError> {
         let _lock = self.lock()?;
         let mut state = self.state()?;
+        if state.write_version > KNOWN_WRITE_VERSION {
+            return Err(StoreError::State(StateError::Newer(state.write_version)));
+        }
         let out = change(&mut state)?;
         state.generation = state.generation.saturating_add(1);
         self.save(&state)?;
