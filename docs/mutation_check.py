@@ -82,6 +82,8 @@ STORE = [
     ("location: relative folders accepted", "location.rs", "env(name).filter(|v| looks_absolute(os, v))", "env(name)"),
     ("state: newer schema accepted", "state.rs", "if head.schema > SCHEMA {", "if false {"),
     ("state: size cap off", "state.rs", "if bytes.len() as u64 > MAX_STATE_BYTES {", "if false {"),
+    ("store: release deleted while leased", "store.rs", "&& !lease::held(&self.root, &record.id, old_version)", "&& lease::held(&self.root, &record.id, old_version)"),
+    ("store: uninstall deleted while leased", "store.rs", "if !lease::held(&self.root, id, version) {", "if lease::held(&self.root, id, version) {"),
 ]
 
 # Survivors that cannot be killed, with the reason. Anything else that survives fails the run.

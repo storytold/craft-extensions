@@ -156,6 +156,42 @@ fn uninstall_removes_files_enablement_and_theme_choice_everywhere() {
 }
 
 #[test]
+fn a_leased_release_survives_an_update_until_it_is_released() {
+    let (_d, s) = store();
+    let rec = s.install_zip(&theme("org.example.ocean", "1.0.0"), Tier::FromFile).unwrap();
+    let _guard = s.acquire_lease(&rec.id, rec.version).unwrap();
+    s.install_zip(&theme("org.example.ocean", "1.1.0"), Tier::FromFile).unwrap();
+    let old = s.package_dir(&rec.id, Version::new(1, 0, 0));
+    assert!(old.is_dir(), "the leased release stays on disk");
+    assert!(old.join("theme.json").is_file(), "a reader can still use it");
+    drop(_guard);
+    s.cleanup().unwrap();
+    assert_eq!(package_folders(&s), vec!["org.example.ocean/1.1.0"], "cleanup removes the released old version");
+}
+
+#[test]
+fn an_uninstall_leaves_a_leased_release_for_cleanup() {
+    let (_d, s) = store();
+    let rec = s.install_zip(&theme("org.example.ocean", "1.0.0"), Tier::FromFile).unwrap();
+    let _guard = s.acquire_lease(&rec.id, rec.version).unwrap();
+    s.uninstall(&rec.id).unwrap();
+    assert!(s.package_dir(&rec.id, Version::new(1, 0, 0)).is_dir(), "the leased release stays on disk");
+    drop(_guard);
+    s.cleanup().unwrap();
+    assert!(package_folders(&s).is_empty(), "cleanup removes it once the lease is gone");
+}
+
+#[test]
+fn cleanup_removes_a_lease_file_from_a_dead_process() {
+    let (_d, s) = store();
+    fs::create_dir_all(s.root().join("leases").join("org.example.ocean").join("1.0.0")).unwrap();
+    fs::write(s.root().join("leases").join("org.example.ocean").join("1.0.0").join("ghost.json"), b"{}").unwrap();
+    assert!(!s.is_leased(&id("org.example.ocean"), Version::new(1, 0, 0)), "an unlocked lease file is not a lease");
+    s.cleanup().unwrap();
+    assert!(!s.root().join("leases").exists(), "empty lease folders go too");
+}
+
+#[test]
 fn enabling_and_choosing_a_theme_follow_the_rules() {
     let (_d, s) = store();
     let th = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
