@@ -81,6 +81,32 @@ fn a_file_cannot_replace_a_first_party_extension_or_use_its_names() {
     assert!(staging_is_empty(&s));
 }
 
+#[test]
+fn a_file_cannot_replace_an_extension_installed_from_the_store() {
+    let (_d, s) = store();
+    // A store-installed third-party extension, as the catalogue client would leave it.
+    let rec = Installed {
+        id: id("org.example.ocean"),
+        version: Version::new(1, 0, 0),
+        kind: Kind::Theme,
+        name: "Ocean".into(),
+        tier: Tier::ReviewedThirdParty,
+        apps: vec![app("photocraft")],
+    };
+    fs::create_dir_all(s.root()).unwrap();
+    let mut state = State::default();
+    state.installed.push(rec.clone());
+    fs::write(s.state_path(), serde_json::to_vec(&state).unwrap()).unwrap();
+    fs::create_dir_all(s.package_dir(&rec.id, rec.version)).unwrap();
+    assert_eq!(s.install_zip(&theme("org.example.ocean", "1.1.0"), Tier::FromFile), Err(StoreError::WouldReplaceStorePackage));
+    let state = s.state().unwrap();
+    assert_eq!(state.installed[0].tier, Tier::ReviewedThirdParty, "the store copy is untouched");
+    assert_eq!(state.generation, 0, "a refused install changes nothing");
+    s.uninstall(&rec.id).unwrap();
+    assert!(s.install_zip(&theme("org.example.ocean", "1.1.0"), Tier::FromFile).is_ok());
+    assert_eq!(s.state().unwrap().installed[0].tier, Tier::FromFile);
+}
+
 #[cfg(not(feature = "third-party"))]
 #[test]
 fn third_party_is_refused_before_anything_is_unpacked() {
@@ -237,6 +263,7 @@ fn every_message_is_plain_language() {
         StoreError::Downgrade,
         StoreError::AlreadyInstalled,
         StoreError::WouldReplaceFirstParty,
+        StoreError::WouldReplaceStorePackage,
         StoreError::NotInstalled,
         StoreError::NotForThisApp,
         StoreError::NotATheme,
