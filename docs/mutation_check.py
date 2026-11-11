@@ -66,6 +66,8 @@ STORE = [
     ("store: first-party replaced by a file", "store.rs", "if existing.tier == Tier::FirstParty && tier != Tier::FirstParty {", "if false {"),
     ("store: downgrade allowed", "store.rs", "if record.version < existing.version {", "if false {"),
     ("store: same version allowed", "store.rs", "if record.version == existing.version {", "if false {"),
+    ("store: install enables every listed app", "store.rs", "state.installed.push(record.clone());", "state.installed.push(record.clone());\n            for app in &record.apps {\n                state.enabled.entry(app.clone()).or_default().insert(record.id.clone());\n            }"),
+    ("store: update keeps dropped apps enabled", "store.rs", ".filter(|app| !record.apps.contains(app))", ".filter(|_app| false)"),
     ("store: existing package folder overwritten", "store.rs", "if destination.exists() {", "if false {"),
     ("store: generation not bumped", "store.rs", "state.generation = state.generation.saturating_add(1);", "state.generation = state.generation;"),
     ("store: lock skipped", "store.rs", "let _lock = self.lock()?;", "let _lock = ();"),

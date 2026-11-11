@@ -122,6 +122,8 @@ mod tests {
         let z = theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme());
         let rec = s.install_zip(&z, Tier::FromFile).unwrap();
         assert_eq!(r.generation(), 1);
+        assert!(r.installed_for(&app("photocraft"), Kind::Theme).is_empty(), "installed but not yet switched on");
+        s.set_enabled(&app("photocraft"), &rec.id, true).unwrap();
         let found = r.installed_for(&app("photocraft"), Kind::Theme);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].installed.id, rec.id);
@@ -150,6 +152,7 @@ mod tests {
         let z = theme_package("org.example.ocean", "1.0.0", &["photocraft", "launcher"], &dark_theme());
         let rec = s.install_zip(&z, Tier::FromFile).unwrap();
         let pc = app("photocraft");
+        s.set_enabled(&pc, &rec.id, true).unwrap();
         assert!(r.active_theme(&pc).is_none(), "nothing is chosen until the person chooses");
         s.set_active_theme(&pc, Some(&rec.id)).unwrap();
         let t = r.active_theme(&pc).unwrap();
@@ -167,6 +170,7 @@ mod tests {
         let (_d, s, r) = setup();
         let pc = app("photocraft");
         let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+        s.set_enabled(&pc, &rec.id, true).unwrap();
         s.set_active_theme(&pc, Some(&rec.id)).unwrap();
         let file = s.package_dir(&rec.id, rec.version).join("theme.json");
         fs::write(&file, low_contrast_theme()).unwrap();
@@ -185,6 +189,7 @@ mod tests {
         let (_d, s, r) = setup();
         let pc = app("photocraft");
         let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+        s.set_enabled(&pc, &rec.id, true).unwrap();
         s.set_active_theme(&pc, Some(&rec.id)).unwrap();
         assert!(r.active_theme(&pc).is_some());
         let mut state = s.state().unwrap();
@@ -210,6 +215,7 @@ mod tests {
         let rec = s.install_zip(&plugin_package("org.example.tone", "1.0.0"), Tier::FromFile).unwrap();
         // Even a perfectly good theme file sitting in the plug-in's folder must not make it a theme.
         fs::write(s.package_dir(&rec.id, rec.version).join("theme.json"), dark_theme()).unwrap();
+        s.set_enabled(&app("photocraft"), &rec.id, true).unwrap();
         let mut state = s.state().unwrap();
         state.active_theme.insert(app("photocraft"), rec.id.clone());
         fs::write(s.root().join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();

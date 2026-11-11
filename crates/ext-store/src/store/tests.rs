@@ -1,4 +1,5 @@
 use super::*;
+use crate::reader::Reader;
 use crate::testutil::*;
 use craft_ext_core::version::Version;
 
@@ -41,7 +42,22 @@ fn staging_is_empty(s: &Store) -> bool {
 }
 
 #[test]
-fn installing_a_theme_puts_it_in_place_and_enables_it_for_its_apps() {
+fn installing_a_package_leaves_it_disabled_until_an_app_turns_it_on() {
+    let (_d, s) = store();
+    let rec = s.install_zip(&theme("org.example.ocean", "1.0.0"), Tier::FromFile).unwrap();
+    let state = s.state().unwrap();
+    assert!(state.enabled.is_empty(), "install enables nothing");
+    assert!(!state.is_enabled(&app("photocraft"), &rec.id) && !state.is_enabled(&app("launcher"), &rec.id));
+    let r = Reader::open(s.root());
+    assert!(r.installed_for(&app("photocraft"), Kind::Theme).is_empty(), "the reader lists nothing until an app switches it on");
+    s.set_enabled(&app("photocraft"), &rec.id, true).unwrap();
+    let state = s.state().unwrap();
+    assert!(state.is_enabled(&app("photocraft"), &rec.id) && !state.is_enabled(&app("launcher"), &rec.id));
+    assert_eq!(r.installed_for(&app("photocraft"), Kind::Theme).len(), 1);
+}
+
+#[test]
+fn installing_a_theme_puts_it_in_place_and_enables_nothing() {
     let (_d, s) = store();
     let rec = s.install_zip(&theme("org.example.ocean", "1.0.0"), Tier::FromFile).unwrap();
     assert_eq!((rec.id.as_str(), rec.version, rec.kind, rec.tier), ("org.example.ocean", Version::new(1, 0, 0), Kind::Theme, Tier::FromFile));
@@ -49,8 +65,7 @@ fn installing_a_theme_puts_it_in_place_and_enables_it_for_its_apps() {
     assert!(s.package_dir(&rec.id, rec.version).join("theme.json").is_file());
     let state = s.state().unwrap();
     assert_eq!(state.generation, 1);
-    assert!(state.is_enabled(&app("photocraft"), &rec.id) && state.is_enabled(&app("launcher"), &rec.id));
-    assert!(!state.is_enabled(&app("filmcraft"), &rec.id));
+    assert!(state.enabled.is_empty(), "install enables nothing; each app turns the package on itself");
     assert!(state.active_theme.is_empty(), "installing never changes anyone's look");
     assert!(staging_is_empty(&s));
 }
@@ -68,6 +83,24 @@ fn a_newer_version_replaces_the_old_one_and_downgrades_are_refused() {
     assert_eq!(s.state().unwrap().generation, 2, "refused installs change nothing");
     assert_eq!(package_folders(&s), vec!["org.example.ocean/1.1.0"]);
     assert!(staging_is_empty(&s));
+}
+
+#[test]
+fn an_update_keeps_enablement_for_surviving_apps_and_clears_dropped_ones() {
+    let (_d, s) = store();
+    let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft", "launcher"], &dark_theme()), Tier::FromFile).unwrap();
+    let pc = app("photocraft");
+    let lc = app("launcher");
+    s.set_enabled(&pc, &rec.id, true).unwrap();
+    s.set_active_theme(&pc, Some(&rec.id)).unwrap();
+    s.set_enabled(&lc, &rec.id, true).unwrap();
+    s.install_zip(&theme_package("org.example.ocean", "1.1.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+    let state = s.state().unwrap();
+    assert!(state.is_enabled(&pc, &rec.id), "an app the new version still supports keeps its choice");
+    assert_eq!(state.active_theme.get(&pc), Some(&rec.id), "its theme choice survives too");
+    assert!(!state.is_enabled(&lc, &rec.id), "an app the new version dropped is switched off");
+    assert!(!state.active_theme.contains_key(&lc), "its theme choice is gone too");
+    assert_eq!(state.installed[0].apps, vec![pc.clone()]);
 }
 
 #[test]
@@ -109,12 +142,12 @@ fn a_hostile_archive_is_refused_and_leaves_nothing_behind() {
 }
 
 #[test]
-fn a_plugin_installs_with_its_interface_and_is_enabled_for_its_app() {
+fn a_plugin_installs_with_its_interface_and_is_left_disabled() {
     let (_d, s) = store();
     let rec = s.install_zip(&plugin_package("org.example.tone", "1.0.0"), Tier::FromFile).unwrap();
     assert_eq!(rec.kind, Kind::Plugin);
     assert!(s.package_dir(&rec.id, rec.version).join("plugin.wasm").is_file());
-    assert!(s.state().unwrap().is_enabled(&app("photocraft"), &rec.id));
+    assert!(!s.state().unwrap().is_enabled(&app("photocraft"), &rec.id), "the app turns the plug-in on itself");
 }
 
 #[test]
@@ -143,6 +176,7 @@ fn an_existing_empty_package_folder_is_not_replaced_either() {
 fn uninstall_removes_files_enablement_and_theme_choice_everywhere() {
     let (_d, s) = store();
     let rec = s.install_zip(&theme("org.example.ocean", "1.0.0"), Tier::FromFile).unwrap();
+    s.set_enabled(&app("photocraft"), &rec.id, true).unwrap();
     s.set_active_theme(&app("photocraft"), Some(&rec.id)).unwrap();
     s.uninstall(&rec.id).unwrap();
     assert!(package_folders(&s).is_empty());
@@ -150,9 +184,9 @@ fn uninstall_removes_files_enablement_and_theme_choice_everywhere() {
     let state = s.state().unwrap();
     assert!(state.installed.is_empty() && state.active_theme.is_empty());
     assert!(!state.is_enabled(&app("photocraft"), &rec.id));
-    assert_eq!(state.generation, 3);
+    assert_eq!(state.generation, 4);
     assert_eq!(s.uninstall(&rec.id), Err(StoreError::NotInstalled));
-    assert_eq!(s.state().unwrap().generation, 3, "a refused change does not bump the generation");
+    assert_eq!(s.state().unwrap().generation, 4, "a refused change does not bump the generation");
 }
 
 #[test]
