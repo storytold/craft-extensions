@@ -68,11 +68,11 @@ The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in RFC 2119
 The shared contract and on-disk store for Craft themes, plug-ins and resources, used by ArtCraft Launcher and the apps. Provisional; the design is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) with [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
 
 - Layout: `crates/ext-core` (`craft-ext-core`: package manifest, ids, paths, trust tiers, theme palette and contrast check, catalogue index schema; pure data and validation; builds for wasm) and `crates/ext-store` (`craft-ext-store`: bounded unpacking, atomic installs, enable per app, the read side apps use; never touches the network).
-- Checks for the crate you changed (CI runs the same):
+- Checks for the crate you changed (CI runs the same four commands over the whole workspace, with `--locked`; the wasm check covers `craft-ext-core` only):
   - `cargo fmt --all --check`
   - `cargo clippy -p <crate> --all-targets -- -D warnings`
   - `cargo test -p <crate>`
   - `cargo check -p craft-ext-core --target wasm32-unknown-unknown`
-  - `python docs/mutation_check.py core` or `store` (edits sources, so it runs alone)
+- Optional, local only (CI does not run it): `python docs/mutation_check.py core` or `store`; it edits sources, so it runs alone.
 - Lints: `[workspace.lints]` in `Cargo.toml`; `unsafe_code` is forbidden, so no module uses `unsafe`.
 - More: [README.md](README.md).
