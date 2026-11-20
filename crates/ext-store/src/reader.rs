@@ -4,10 +4,13 @@
 //! or that fails validation counts as absent (an app keeps its own look rather than showing an error
 //! dialog at start-up), and a running app can poll `generation` cheaply to learn that something changed.
 
+use crate::layout;
 use crate::state::{Installed, STATE_FILE, State};
 use craft_ext_core::id::{AppId, ExtensionId};
 use craft_ext_core::manifest::{Kind, THEME_FILE};
 use craft_ext_core::palette::{MAX_THEME_BYTES, Palette, Rgb, ThemeFile};
+use craft_ext_core::path::validate_path;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -51,7 +54,26 @@ impl Reader {
     }
 
     fn dir_of(&self, i: &Installed) -> PathBuf {
-        self.root.join("packages").join(i.id.as_str()).join(i.version.to_string())
+        layout::installed_dir(&self.root, i)
+    }
+
+    fn verified(&self, i: &Installed) -> bool {
+        let Some(manifest) = &i.manifest else { return true };
+        let dir = self.dir_of(i);
+        manifest.files.iter().all(|entry| {
+            if validate_path(&entry.path).is_err() {
+                return false;
+            }
+            let Ok(file) = File::open(dir.join(&entry.path)) else { return false };
+            let cap = entry.size.saturating_add(1);
+            let mut bytes = Vec::new();
+            if file.take(cap).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != entry.size {
+                return false;
+            }
+            let digest = Sha256::digest(&bytes);
+            let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            hex.eq_ignore_ascii_case(&entry.sha256)
+        })
     }
 
     /// Extensions of this kind that are installed and switched on for `app`, whose files are still there.
@@ -60,7 +82,7 @@ impl Reader {
         state
             .installed
             .iter()
-            .filter(|i| i.kind == kind && i.apps.contains(app) && state.is_enabled(app, &i.id))
+            .filter(|i| i.kind == kind && i.apps.contains(app) && state.is_enabled(app, &i.id) && !state.is_revoked(i) && self.verified(i))
             .map(|i| Found { installed: i.clone(), dir: self.dir_of(i) })
             .filter(|f| f.dir.is_dir())
             .collect()
@@ -71,7 +93,7 @@ impl Reader {
         let state = self.state()?;
         let id = state.active_theme.get(app)?;
         let installed = state.find(id)?;
-        if installed.kind != Kind::Theme || !state.is_enabled(app, id) {
+        if installed.kind != Kind::Theme || !state.is_enabled(app, id) || state.is_revoked(installed) || !self.verified(installed) {
             return None;
         }
         let theme = read_theme(&self.dir_of(installed).join(THEME_FILE))?;
@@ -122,6 +144,8 @@ mod tests {
         let z = theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme());
         let rec = s.install_zip(&z, Tier::FromFile).unwrap();
         assert_eq!(r.generation(), 1);
+        assert!(r.installed_for(&app("photocraft"), Kind::Theme).is_empty(), "installed but not yet switched on");
+        s.set_enabled(&app("photocraft"), &rec.id, true).unwrap();
         let found = r.installed_for(&app("photocraft"), Kind::Theme);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].installed.id, rec.id);
@@ -150,6 +174,7 @@ mod tests {
         let z = theme_package("org.example.ocean", "1.0.0", &["photocraft", "launcher"], &dark_theme());
         let rec = s.install_zip(&z, Tier::FromFile).unwrap();
         let pc = app("photocraft");
+        s.set_enabled(&pc, &rec.id, true).unwrap();
         assert!(r.active_theme(&pc).is_none(), "nothing is chosen until the person chooses");
         s.set_active_theme(&pc, Some(&rec.id)).unwrap();
         let t = r.active_theme(&pc).unwrap();
@@ -167,17 +192,51 @@ mod tests {
         let (_d, s, r) = setup();
         let pc = app("photocraft");
         let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+        s.set_enabled(&pc, &rec.id, true).unwrap();
         s.set_active_theme(&pc, Some(&rec.id)).unwrap();
-        let file = s.package_dir(&rec.id, rec.version).join("theme.json");
+        let file = crate::layout::installed_dir(s.root(), &rec).join("theme.json");
         fs::write(&file, low_contrast_theme()).unwrap();
         assert!(r.active_theme(&pc).is_none(), "a theme that fails the checks again is not worn");
         fs::write(&file, b"garbage").unwrap();
         assert!(r.active_theme(&pc).is_none());
         fs::write(&file, vec![b' '; MAX_THEME_BYTES + 10]).unwrap();
         assert!(r.active_theme(&pc).is_none());
-        fs::remove_dir_all(s.package_dir(&rec.id, rec.version)).unwrap();
+        fs::remove_dir_all(crate::layout::installed_dir(s.root(), &rec)).unwrap();
         assert!(r.active_theme(&pc).is_none());
         assert!(r.installed_for(&pc, Kind::Theme).is_empty(), "files that are gone are not listed");
+    }
+
+    #[test]
+    fn a_file_changed_after_install_is_not_served_even_if_it_still_parses() {
+        let (_d, s, r) = setup();
+        let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+        let pc = app("photocraft");
+        s.set_enabled(&pc, &rec.id, true).unwrap();
+        s.set_active_theme(&pc, Some(&rec.id)).unwrap();
+        let mut changed = dark_theme();
+        changed.push(b' ');
+        fs::write(crate::layout::installed_dir(s.root(), &rec).join("theme.json"), &changed).unwrap();
+        assert!(r.installed_for(&pc, Kind::Theme).is_empty(), "a changed file is not listed even though it is still valid json");
+        assert!(r.active_theme(&pc).is_none());
+    }
+
+    #[test]
+    fn a_legacy_theme_is_still_validated_when_it_is_read() {
+        let (_d, s, r) = setup();
+        let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+        let pc = app("photocraft");
+        s.set_enabled(&pc, &rec.id, true).unwrap();
+        s.set_active_theme(&pc, Some(&rec.id)).unwrap();
+        let mut state = s.state().unwrap();
+        let mut legacy = state.installed[0].clone();
+        legacy.sha256.clear();
+        legacy.manifest = None;
+        state.installed[0] = legacy;
+        fs::write(s.root().join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();
+        let legacy_dir = s.package_dir(&rec.id, rec.version);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("theme.json"), low_contrast_theme()).unwrap();
+        assert!(r.active_theme(&pc).is_none(), "a legacy record still gets its theme validated on load");
     }
 
     #[test]
@@ -185,6 +244,7 @@ mod tests {
         let (_d, s, r) = setup();
         let pc = app("photocraft");
         let rec = s.install_zip(&theme_package("org.example.ocean", "1.0.0", &["photocraft"], &dark_theme()), Tier::FromFile).unwrap();
+        s.set_enabled(&pc, &rec.id, true).unwrap();
         s.set_active_theme(&pc, Some(&rec.id)).unwrap();
         assert!(r.active_theme(&pc).is_some());
         let mut state = s.state().unwrap();
@@ -209,7 +269,8 @@ mod tests {
         let (_d, s, r) = setup();
         let rec = s.install_zip(&plugin_package("org.example.tone", "1.0.0"), Tier::FromFile).unwrap();
         // Even a perfectly good theme file sitting in the plug-in's folder must not make it a theme.
-        fs::write(s.package_dir(&rec.id, rec.version).join("theme.json"), dark_theme()).unwrap();
+        fs::write(crate::layout::installed_dir(s.root(), &rec).join("theme.json"), dark_theme()).unwrap();
+        s.set_enabled(&app("photocraft"), &rec.id, true).unwrap();
         let mut state = s.state().unwrap();
         state.active_theme.insert(app("photocraft"), rec.id.clone());
         fs::write(s.root().join(STATE_FILE), serde_json::to_vec(&state).unwrap()).unwrap();

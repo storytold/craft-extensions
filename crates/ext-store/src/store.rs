@@ -3,20 +3,25 @@
 //! Layout under the store root:
 //!   packages/<id>/<version>/...   unpacked, never edited afterwards
 //!   staging/<unique>/             where a package is unpacked and checked before it counts
+//!   leases/<id>/<version>/<unique>.json  a reader's hold on a release it is still using
 //!   state.json                    what is installed and enabled (see `state`)
 //!   .lock                         held while the state file changes
 //!
 //! Invariants: an install is all or nothing. The package is unpacked and checked outside the lock, the
 //! lock covers only the move into place and the state write, the state file is replaced atomically with
 //! a bumped generation, and a failure leaves the previous state and no stray package folder. A file
-//! can never replace a first-party extension, and a downgrade is refused.
+//! can never replace an extension installed from the store or catalogue, and a downgrade is refused.
 
-use crate::state::{Installed, STATE_FILE, State, StateError};
+use crate::layout;
+use crate::lease::{self, LeaseGuard};
+use crate::state::{Installed, KNOWN_WRITE_VERSION, Revocation, STATE_FILE, State, StateError, WRITE_VERSION};
 use crate::unpack::{Caps, UnpackError, unpack_into};
 use craft_ext_core::id::{AppId, ExtensionId};
 use craft_ext_core::manifest::{Kind, THEME_FILE};
 use craft_ext_core::palette::{ThemeError, ThemeFile};
 use craft_ext_core::tier::{Policy, Tier, TierError};
+use craft_ext_core::version::Version;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io::Read;
@@ -36,11 +41,14 @@ pub enum StoreError {
     Downgrade,
     AlreadyInstalled,
     WouldReplaceFirstParty,
+    WouldReplaceStorePackage,
     NotInstalled,
     NotForThisApp,
     NotATheme,
     NotEnabled,
     Io,
+    Revoked,
+    VersionMismatch,
 }
 
 impl fmt::Display for StoreError {
@@ -54,11 +62,16 @@ impl fmt::Display for StoreError {
             StoreError::Downgrade => f.write_str("a newer version of this extension is already installed"),
             StoreError::AlreadyInstalled => f.write_str("this version of the extension is already installed"),
             StoreError::WouldReplaceFirstParty => f.write_str("this file would replace an extension made by ArtCraft, which is not allowed"),
+            StoreError::WouldReplaceStorePackage => {
+                f.write_str("this file has the same id as an extension installed from the catalogue; remove that extension first")
+            }
             StoreError::NotInstalled => f.write_str("that extension is not installed"),
             StoreError::NotForThisApp => f.write_str("that extension is not made for this app"),
             StoreError::NotATheme => f.write_str("only a theme can be chosen as the look of an app"),
             StoreError::NotEnabled => f.write_str("turn the theme on for this app before choosing it"),
             StoreError::Io => f.write_str("the extension files could not be saved"),
+            StoreError::Revoked => f.write_str("this extension has been withdrawn and can no longer be used"),
+            StoreError::VersionMismatch => f.write_str("this package is not the version you asked for"),
         }
     }
 }
@@ -81,7 +94,7 @@ pub struct Store {
     caps: Caps,
 }
 
-fn unique_name() -> String {
+pub(crate) fn unique_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     format!("{}-{}-{}", std::process::id(), nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -108,6 +121,13 @@ impl Store {
         State::read(&self.state_path()).map_err(StoreError::State)
     }
 
+    pub fn set_revocations(&self, revocations: Vec<Revocation>) -> Result<(), StoreError> {
+        self.update(|state| {
+            state.revocations = revocations;
+            Ok(())
+        })
+    }
+
     fn lock(&self) -> Result<Lock, StoreError> {
         fs::create_dir_all(&self.root).map_err(|_| StoreError::Io)?;
         let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.root.join(".lock")).map_err(|_| StoreError::Io)?;
@@ -126,6 +146,9 @@ impl Store {
     fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T, StoreError>) -> Result<T, StoreError> {
         let _lock = self.lock()?;
         let mut state = self.state()?;
+        if state.write_version > KNOWN_WRITE_VERSION {
+            return Err(StoreError::State(StateError::Newer(state.write_version)));
+        }
         let out = change(&mut state)?;
         state.generation = state.generation.saturating_add(1);
         self.save(&state)?;
@@ -133,15 +156,26 @@ impl Store {
     }
 
     fn save(&self, state: &State) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec_pretty(state).map_err(|_| StoreError::Io)?;
+        let mut state = state.clone();
+        state.write_version = WRITE_VERSION;
+        let bytes = serde_json::to_vec_pretty(&state).map_err(|_| StoreError::Io)?;
         craft_atomic::atomic_write(&self.state_path(), &bytes).map_err(|_| StoreError::Io)
     }
 
     /// Installs a package from an archive held in memory. `tier` is where the caller got it from.
+    /// The package is left disabled; each app turns it on itself with `set_enabled`.
     pub fn install_zip(&self, bytes: &[u8], tier: Tier) -> Result<Installed, StoreError> {
+        self.install_zip_policy(bytes, tier, None)
+    }
+
+    pub fn install_version(&self, bytes: &[u8], tier: Tier, version: Version) -> Result<Installed, StoreError> {
+        self.install_zip_policy(bytes, tier, Some(version))
+    }
+
+    fn install_zip_policy(&self, bytes: &[u8], tier: Tier, requested: Option<Version>) -> Result<Installed, StoreError> {
         self.policy.admit(tier).map_err(StoreError::Tier)?;
         let staging = self.root.join("staging").join(unique_name());
-        let outcome = self.install_staged(bytes, tier, &staging);
+        let outcome = self.install_staged(bytes, tier, &staging, requested);
         // On success the folder was moved away and this finds nothing; on failure it removes the debris.
         let _ = fs::remove_dir_all(&staging);
         outcome
@@ -158,8 +192,12 @@ impl Store {
         self.install_zip(&bytes, tier)
     }
 
-    fn install_staged(&self, bytes: &[u8], tier: Tier, staging: &Path) -> Result<Installed, StoreError> {
+    fn install_staged(&self, bytes: &[u8], tier: Tier, staging: &Path, requested: Option<Version>) -> Result<Installed, StoreError> {
         let manifest = unpack_into(bytes, staging, self.caps).map_err(StoreError::Unpack)?;
+        if requested.is_some_and(|v| v != manifest.version) {
+            return Err(StoreError::VersionMismatch);
+        }
+        let digest = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
         self.policy.check_id(tier, &manifest.id).map_err(StoreError::Tier)?;
         if manifest.kind == Kind::Theme {
             let text = fs::read(staging.join(THEME_FILE)).map_err(|_| StoreError::Io)?;
@@ -172,44 +210,91 @@ impl Store {
             name: manifest.name.clone(),
             tier,
             apps: manifest.compat.keys().cloned().collect(),
+            sha256: digest.clone(),
+            manifest: Some(manifest.clone()),
         };
-        let destination = self.package_dir(&record.id, record.version);
-        let mut old_dir = None;
-        self.update(|state| {
-            if let Some(existing) = state.find(&record.id) {
-                if existing.tier == Tier::FirstParty && tier != Tier::FirstParty {
-                    return Err(StoreError::WouldReplaceFirstParty);
+        let current = self.state()?;
+        let revoked_digest = |state: &State| state.revocations.iter().any(|r| r.sha256.as_ref().is_some_and(|h| h.eq_ignore_ascii_case(&digest)));
+        if let Some(existing) = current.find(&record.id)
+            && existing.version == record.version
+            && existing.sha256 == record.sha256
+            && !revoked_digest(&current)
+            && layout::release_dir(&self.root, &record.id, record.version, &digest).is_dir()
+        {
+            return Ok(existing.clone());
+        }
+        let destination = layout::release_dir(&self.root, &record.id, record.version, &digest);
+        let mut old_dir: Option<(PathBuf, Version)> = None;
+        let result = self
+            .update(|state| {
+                if revoked_digest(state) {
+                    return Err(StoreError::Revoked);
                 }
-                if record.version < existing.version {
-                    return Err(StoreError::Downgrade);
+                if let Some(existing) = state.find(&record.id) {
+                    if existing.version == record.version
+                        && existing.sha256 == record.sha256
+                        && layout::release_dir(&self.root, &record.id, record.version, &digest).exists()
+                    {
+                        return Ok(Some(existing.clone()));
+                    }
+                    if existing.tier == Tier::FirstParty && tier != Tier::FirstParty {
+                        return Err(StoreError::WouldReplaceFirstParty);
+                    }
+                    if tier == Tier::FromFile && existing.tier != Tier::FromFile {
+                        return Err(StoreError::WouldReplaceStorePackage);
+                    }
+                    if requested.is_none() && record.version < existing.version {
+                        return Err(StoreError::Downgrade);
+                    }
+                    if record.version == existing.version {
+                        return Err(StoreError::AlreadyInstalled);
+                    }
+                    old_dir = Some((layout::installed_dir(&self.root, existing), existing.version));
                 }
-                if record.version == existing.version {
-                    return Err(StoreError::AlreadyInstalled);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).map_err(|_| StoreError::Io)?;
                 }
-                old_dir = Some(self.package_dir(&existing.id, existing.version));
-            }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).map_err(|_| StoreError::Io)?;
-            }
-            if destination.exists() {
-                return Err(StoreError::Io);
-            }
-            fs::rename(staging, &destination).map_err(|_| StoreError::Io)?;
-            state.installed.retain(|i| i.id != record.id);
-            state.installed.push(record.clone());
-            for app in &record.apps {
-                state.enabled.entry(app.clone()).or_default().insert(record.id.clone());
-            }
-            Ok(())
-        })
-        .inspect_err(|_| {
-            // The package was moved into place but the state could not be saved: put things back.
-            if !staging.exists() && destination.exists() && self.state().is_ok_and(|s| s.find(&record.id).is_none_or(|i| i.version != record.version))
-            {
-                let _ = fs::remove_dir_all(&destination);
-            }
-        })?;
-        if let Some(dir) = old_dir {
+                if destination.exists() {
+                    return Err(StoreError::Io);
+                }
+                fs::rename(staging, &destination).map_err(|_| StoreError::Io)?;
+                state.installed.retain(|i| i.id != record.id);
+                state.installed.push(record.clone());
+                // Installing enables nothing; each app is switched on explicitly. An update keeps every
+                // app's existing choice, and clears it for apps the new version no longer supports.
+                let dropped: Vec<AppId> = state
+                    .enabled
+                    .iter()
+                    .filter(|(_, set)| set.contains(&record.id))
+                    .map(|(app, _)| app.clone())
+                    .filter(|app| !record.apps.contains(app))
+                    .collect();
+                for app in dropped {
+                    if let Some(set) = state.enabled.get_mut(&app) {
+                        set.remove(&record.id);
+                    }
+                    if state.active_theme.get(&app) == Some(&record.id) {
+                        state.active_theme.remove(&app);
+                    }
+                }
+                Ok(None)
+            })
+            .inspect_err(|_| {
+                // The package was moved into place but the state could not be saved: put things back.
+                if !staging.exists()
+                    && destination.exists()
+                    && self.state().is_ok_and(|s| s.find(&record.id).is_none_or(|i| i.version != record.version))
+                {
+                    let _ = fs::remove_dir_all(&destination);
+                }
+            })?;
+        if let Some(existing) = result {
+            let _ = fs::remove_dir_all(staging);
+            return Ok(existing);
+        }
+        if let Some((dir, old_version)) = old_dir
+            && !lease::held(&self.root, &record.id, old_version)
+        {
             let _ = fs::remove_dir_all(dir);
         }
         Ok(record)
@@ -217,25 +302,48 @@ impl Store {
 
     /// Removes an extension everywhere: its files, its enablement and any app's choice of it as theme.
     pub fn uninstall(&self, id: &ExtensionId) -> Result<(), StoreError> {
-        let dir = self.update(|state| {
+        let (dir, version) = self.update(|state| {
             let existing = state.find(id).ok_or(StoreError::NotInstalled)?.clone();
             state.installed.retain(|i| &i.id != id);
             state.enabled.values_mut().for_each(|set| {
                 set.remove(id);
             });
             state.active_theme.retain(|_, chosen| chosen != id);
-            Ok(self.package_dir(&existing.id, existing.version))
+            Ok((layout::installed_dir(&self.root, &existing), existing.version))
         })?;
-        let _ = fs::remove_dir_all(dir);
+        if !lease::held(&self.root, id, version) {
+            let _ = fs::remove_dir_all(dir);
+        }
         // Only succeeds when no other version folder is left.
         let _ = fs::remove_dir(self.root.join("packages").join(id.as_str()));
         Ok(())
+    }
+
+    /// Holds a lease on one installed release while a reader still uses its files. The lease ends
+    /// when the returned guard is dropped.
+    pub fn acquire_lease(&self, id: &ExtensionId, version: Version) -> Result<LeaseGuard, StoreError> {
+        lease::acquire(&self.root, id, version)
+    }
+
+    /// True while a live lease exists on that release. A lease whose holder is gone counts as gone.
+    pub fn is_leased(&self, id: &ExtensionId, version: Version) -> bool {
+        lease::held(&self.root, id, version)
+    }
+
+    /// Removes lease files whose holder is gone and release directories that are neither the
+    /// installed version nor protected by a live lease.
+    pub fn cleanup(&self) -> Result<(), StoreError> {
+        let state = self.state()?;
+        lease::cleanup(&self.root, &state.installed)
     }
 
     /// Turns an installed extension on or off for one app. Turning a theme off also stops the app using it.
     pub fn set_enabled(&self, app: &AppId, id: &ExtensionId, on: bool) -> Result<(), StoreError> {
         self.update(|state| {
             let existing = state.find(id).ok_or(StoreError::NotInstalled)?;
+            if on && state.is_revoked(existing) {
+                return Err(StoreError::Revoked);
+            }
             if !existing.apps.contains(app) {
                 return Err(StoreError::NotForThisApp);
             }
