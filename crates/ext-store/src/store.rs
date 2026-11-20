@@ -138,6 +138,7 @@ impl Store {
     }
 
     /// Installs a package from an archive held in memory. `tier` is where the caller got it from.
+    /// The package is left disabled; each app turns it on itself with `set_enabled`.
     pub fn install_zip(&self, bytes: &[u8], tier: Tier) -> Result<Installed, StoreError> {
         self.policy.admit(tier).map_err(StoreError::Tier)?;
         let staging = self.root.join("staging").join(unique_name());
@@ -197,8 +198,22 @@ impl Store {
             fs::rename(staging, &destination).map_err(|_| StoreError::Io)?;
             state.installed.retain(|i| i.id != record.id);
             state.installed.push(record.clone());
-            for app in &record.apps {
-                state.enabled.entry(app.clone()).or_default().insert(record.id.clone());
+            // Installing enables nothing; each app is switched on explicitly. An update keeps every
+            // app's existing choice, and clears it for apps the new version no longer supports.
+            let dropped: Vec<AppId> = state
+                .enabled
+                .iter()
+                .filter(|(_, set)| set.contains(&record.id))
+                .map(|(app, _)| app.clone())
+                .filter(|app| !record.apps.contains(app))
+                .collect();
+            for app in dropped {
+                if let Some(set) = state.enabled.get_mut(&app) {
+                    set.remove(&record.id);
+                }
+                if state.active_theme.get(&app) == Some(&record.id) {
+                    state.active_theme.remove(&app);
+                }
             }
             Ok(())
         })
