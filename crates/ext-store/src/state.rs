@@ -1,8 +1,8 @@
 //! The state file: what is installed, enabled for which app, and which theme each app uses.
 //!
-//! Invariants: read with a size cap; a newer schema is refused rather than half understood; a missing
-//! file is an empty state; every change made through the store bumps `generation`, which running apps
-//! watch to notice an install without any other signal.
+//! Invariants: read with a size cap; a newer state format is refused rather than half understood; a file
+//! written by a newer app is not overwritten; a missing file is an empty state; every change made through
+//! the store bumps `generation`, which running apps watch to notice an install without any other signal.
 
 use craft_ext_core::id::{AppId, ExtensionId};
 use craft_ext_core::manifest::Kind;
@@ -18,6 +18,10 @@ use std::path::Path;
 pub const STATE_FILE: &str = "state.json";
 pub const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 pub const SCHEMA: u32 = 1;
+/// The highest state format this build fully understands. Files declaring more are refused.
+pub const KNOWN_READ_VERSION: u32 = 1;
+/// The highest state format this build can save without dropping another app's fields.
+pub const KNOWN_WRITE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installed {
@@ -34,6 +38,13 @@ pub struct Installed {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub schema: u32,
+    /// The format this state follows for reading, with `schema` as the value for older files.
+    #[serde(default = "default_version")]
+    pub read_version: u32,
+    /// The format the app that saved this could write; overwriting such a file would drop its newer
+    /// fields, so an older writer refuses.
+    #[serde(default = "default_version")]
+    pub write_version: u32,
     pub generation: u64,
     #[serde(default)]
     pub installed: Vec<Installed>,
@@ -45,8 +56,20 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        Self { schema: SCHEMA, generation: 0, installed: Vec::new(), enabled: BTreeMap::new(), active_theme: BTreeMap::new() }
+        Self {
+            schema: SCHEMA,
+            read_version: SCHEMA,
+            write_version: SCHEMA,
+            generation: 0,
+            installed: Vec::new(),
+            enabled: BTreeMap::new(),
+            active_theme: BTreeMap::new(),
+        }
     }
+}
+
+fn default_version() -> u32 {
+    SCHEMA
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +96,8 @@ impl std::error::Error for StateError {}
 #[derive(Deserialize)]
 struct Head {
     schema: u32,
+    #[serde(default)]
+    read_version: Option<u32>,
 }
 
 impl State {
@@ -90,8 +115,9 @@ impl State {
             return Err(StateError::TooLarge);
         }
         let head: Head = serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
-        if head.schema > SCHEMA {
-            return Err(StateError::Newer(head.schema));
+        let read_version = head.read_version.unwrap_or(head.schema);
+        if read_version > KNOWN_READ_VERSION {
+            return Err(StateError::Newer(read_version));
         }
         let state: State = serde_json::from_slice(&bytes).map_err(|_| StateError::Corrupt)?;
         if state.schema != SCHEMA {
@@ -171,5 +197,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), r#"{"schema":1,"generation":9,"extra":{"a":1}}"#);
         assert_eq!(State::read(&p).unwrap().generation, 9);
+    }
+
+    #[test]
+    fn a_state_from_a_newer_reader_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"{"schema":1,"generation":7,"read_version":2,"write_version":2,"installed":[]}"#;
+        let p = write(dir.path(), text);
+        assert_eq!(State::read(&p), Err(StateError::Newer(2)));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
     }
 }

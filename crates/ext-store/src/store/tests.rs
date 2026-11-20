@@ -218,6 +218,16 @@ fn a_damaged_or_newer_state_file_blocks_changes_and_is_left_untouched() {
 }
 
 #[test]
+fn a_state_written_by_a_newer_app_blocks_changes_and_is_left_untouched() {
+    let (_d, s) = store();
+    fs::create_dir_all(s.root()).unwrap();
+    let path = s.root().join(STATE_FILE);
+    fs::write(&path, br#"{"schema":1,"generation":7,"read_version":1,"write_version":2,"installed":[]}"#).unwrap();
+    assert_eq!(s.uninstall(&id("org.example.ocean")), Err(StoreError::State(StateError::Newer(2))));
+    assert_eq!(fs::read(&path).unwrap(), br#"{"schema":1,"generation":7,"read_version":1,"write_version":2,"installed":[]}"#);
+}
+
+#[test]
 fn install_file_reads_a_file_and_refuses_a_giant_one() {
     let (d, s) = store();
     let path = d.path().join("ocean.craftext");
