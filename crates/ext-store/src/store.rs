@@ -3,6 +3,7 @@
 //! Layout under the store root:
 //!   packages/<id>/<version>/...   unpacked, never edited afterwards
 //!   staging/<unique>/             where a package is unpacked and checked before it counts
+//!   leases/<id>/<version>/<unique>.json  a reader's hold on a release it is still using
 //!   state.json                    what is installed and enabled (see `state`)
 //!   .lock                         held while the state file changes
 //!
@@ -11,12 +12,14 @@
 //! a bumped generation, and a failure leaves the previous state and no stray package folder. A file
 //! can never replace a first-party extension, and a downgrade is refused.
 
+use crate::lease::{self, LeaseGuard};
 use crate::state::{Installed, STATE_FILE, State, StateError};
 use crate::unpack::{Caps, UnpackError, unpack_into};
 use craft_ext_core::id::{AppId, ExtensionId};
 use craft_ext_core::manifest::{Kind, THEME_FILE};
 use craft_ext_core::palette::{ThemeError, ThemeFile};
 use craft_ext_core::tier::{Policy, Tier, TierError};
+use craft_ext_core::version::Version;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io::Read;
@@ -81,7 +84,7 @@ pub struct Store {
     caps: Caps,
 }
 
-fn unique_name() -> String {
+pub(crate) fn unique_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     format!("{}-{}-{}", std::process::id(), nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -174,7 +177,7 @@ impl Store {
             apps: manifest.compat.keys().cloned().collect(),
         };
         let destination = self.package_dir(&record.id, record.version);
-        let mut old_dir = None;
+        let mut old_dir: Option<(PathBuf, Version)> = None;
         self.update(|state| {
             if let Some(existing) = state.find(&record.id) {
                 if existing.tier == Tier::FirstParty && tier != Tier::FirstParty {
@@ -186,7 +189,7 @@ impl Store {
                 if record.version == existing.version {
                     return Err(StoreError::AlreadyInstalled);
                 }
-                old_dir = Some(self.package_dir(&existing.id, existing.version));
+                old_dir = Some((self.package_dir(&existing.id, existing.version), existing.version));
             }
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).map_err(|_| StoreError::Io)?;
@@ -209,7 +212,9 @@ impl Store {
                 let _ = fs::remove_dir_all(&destination);
             }
         })?;
-        if let Some(dir) = old_dir {
+        if let Some((dir, old_version)) = old_dir
+            && !lease::held(&self.root, &record.id, old_version)
+        {
             let _ = fs::remove_dir_all(dir);
         }
         Ok(record)
@@ -217,19 +222,39 @@ impl Store {
 
     /// Removes an extension everywhere: its files, its enablement and any app's choice of it as theme.
     pub fn uninstall(&self, id: &ExtensionId) -> Result<(), StoreError> {
-        let dir = self.update(|state| {
+        let (dir, version) = self.update(|state| {
             let existing = state.find(id).ok_or(StoreError::NotInstalled)?.clone();
             state.installed.retain(|i| &i.id != id);
             state.enabled.values_mut().for_each(|set| {
                 set.remove(id);
             });
             state.active_theme.retain(|_, chosen| chosen != id);
-            Ok(self.package_dir(&existing.id, existing.version))
+            Ok((self.package_dir(&existing.id, existing.version), existing.version))
         })?;
-        let _ = fs::remove_dir_all(dir);
+        if !lease::held(&self.root, id, version) {
+            let _ = fs::remove_dir_all(dir);
+        }
         // Only succeeds when no other version folder is left.
         let _ = fs::remove_dir(self.root.join("packages").join(id.as_str()));
         Ok(())
+    }
+
+    /// Holds a lease on one installed release while a reader still uses its files. The lease ends
+    /// when the returned guard is dropped.
+    pub fn acquire_lease(&self, id: &ExtensionId, version: Version) -> Result<LeaseGuard, StoreError> {
+        lease::acquire(&self.root, id, version)
+    }
+
+    /// True while a live lease exists on that release. A lease whose holder is gone counts as gone.
+    pub fn is_leased(&self, id: &ExtensionId, version: Version) -> bool {
+        lease::held(&self.root, id, version)
+    }
+
+    /// Removes lease files whose holder is gone and release directories that are neither the
+    /// installed version nor protected by a live lease.
+    pub fn cleanup(&self) -> Result<(), StoreError> {
+        let state = self.state()?;
+        lease::cleanup(&self.root, &state.installed)
     }
 
     /// Turns an installed extension on or off for one app. Turning a theme off also stops the app using it.
