@@ -9,7 +9,7 @@
 //! Invariants: an install is all or nothing. The package is unpacked and checked outside the lock, the
 //! lock covers only the move into place and the state write, the state file is replaced atomically with
 //! a bumped generation, and a failure leaves the previous state and no stray package folder. A file
-//! can never replace a first-party extension, and a downgrade is refused.
+//! can never replace an extension installed from the store or catalogue, and a downgrade is refused.
 
 use crate::state::{Installed, STATE_FILE, State, StateError};
 use crate::unpack::{Caps, UnpackError, unpack_into};
@@ -36,6 +36,7 @@ pub enum StoreError {
     Downgrade,
     AlreadyInstalled,
     WouldReplaceFirstParty,
+    WouldReplaceStorePackage,
     NotInstalled,
     NotForThisApp,
     NotATheme,
@@ -54,6 +55,9 @@ impl fmt::Display for StoreError {
             StoreError::Downgrade => f.write_str("a newer version of this extension is already installed"),
             StoreError::AlreadyInstalled => f.write_str("this version of the extension is already installed"),
             StoreError::WouldReplaceFirstParty => f.write_str("this file would replace an extension made by ArtCraft, which is not allowed"),
+            StoreError::WouldReplaceStorePackage => {
+                f.write_str("this file has the same id as an extension installed from the catalogue; remove that extension first")
+            }
             StoreError::NotInstalled => f.write_str("that extension is not installed"),
             StoreError::NotForThisApp => f.write_str("that extension is not made for this app"),
             StoreError::NotATheme => f.write_str("only a theme can be chosen as the look of an app"),
@@ -179,6 +183,9 @@ impl Store {
             if let Some(existing) = state.find(&record.id) {
                 if existing.tier == Tier::FirstParty && tier != Tier::FirstParty {
                     return Err(StoreError::WouldReplaceFirstParty);
+                }
+                if tier == Tier::FromFile && existing.tier != Tier::FromFile {
+                    return Err(StoreError::WouldReplaceStorePackage);
                 }
                 if record.version < existing.version {
                     return Err(StoreError::Downgrade);
